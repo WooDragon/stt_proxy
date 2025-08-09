@@ -1,0 +1,6 @@
+{
+  "language": "zh",
+  "temperature": 0.2,
+  "prompt": "以下是普通话的会议记录。",
+  "response_format": "srt"
+}
