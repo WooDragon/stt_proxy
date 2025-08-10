@@ -7,6 +7,7 @@ import argparse
 import json
 import logging
 import os
+from contextlib import asynccontextmanager
 from typing import Dict, Optional
 
 import httpx
@@ -16,12 +17,6 @@ from fastapi.responses import Response
 # 配置日志
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
-
-app = FastAPI(
-    title="STT Proxy Service",
-    docs_url=None,  # 禁用文档页面以提高性能
-    redoc_url=None  # 禁用Redoc页面以提高性能
-)
 
 # 全局变量
 config: Dict = {}
@@ -52,10 +47,13 @@ def load_config(config_path: str) -> Dict:
         return {}
 
 
-@app.on_event("startup")
-async def startup_event():
-    """应用启动时初始化"""
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """应用生命周期管理"""
     global http_client, target_base_url, config
+    
+    # 启动时初始化
+    logger.info("应用启动中...")
     
     # 获取配置文件路径
     config_path = os.environ.get("STT_CONFIG_PATH", "config/stt_config.json")
@@ -79,14 +77,23 @@ async def startup_event():
     target_port = os.environ.get("TARGET_PORT", "10240")
     target_base_url = f"http://{target_host}:{target_port}"
     logger.info(f"目标服务URL: {target_base_url}")
-
-
-@app.on_event("shutdown")
-async def shutdown_event():
-    """应用关闭时清理资源"""
-    global http_client
+    
+    yield
+    
+    # 关闭时清理资源
+    logger.info("应用关闭中...")
     if http_client:
         await http_client.aclose()
+        logger.info("HTTP客户端已关闭")
+
+
+# 创建 FastAPI 应用实例
+app = FastAPI(
+    title="STT Proxy Service",
+    docs_url=None,  # 禁用文档页面以提高性能
+    redoc_url=None,  # 禁用Redoc页面以提高性能
+    lifespan=lifespan  # 使用 lifespan 事件处理器
+)
 
 
 async def forward_request(request: Request, modified_form_data: dict = None, files: dict = None) -> Response:
