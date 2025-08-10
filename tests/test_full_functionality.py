@@ -7,8 +7,8 @@ import json
 import os
 import sys
 
-# 添加当前目录到Python路径
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+# 添加src目录到Python路径
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'src'))
 
 from stt_proxy import load_config
 
@@ -18,7 +18,7 @@ def test_complete_functionality():
     print("测试完整功能...")
     
     # 1. 加载配置文件
-    config = load_config("stt_config.json")
+    config = load_config("config/stt_config.json")
     print(f"1. 配置文件内容: {config}")
     
     # 2. 模拟各种客户端请求场景
@@ -28,7 +28,7 @@ def test_complete_functionality():
             "client_data": {
                 "language": "en",
                 "temperature": 0.8,
-                "prompt": "English conversation",
+                "initial_prompt": "English conversation",
                 "response_format": "json",
                 "model": "whisper-base"
             }
@@ -94,7 +94,7 @@ def test_configuration_priority():
     """测试配置优先级"""
     print("\n3. 测试配置优先级...")
     
-    config = load_config("stt_config.json")
+    config = load_config("config/stt_config.json")
     
     # 验证配置文件中的每个字段都会强制覆盖客户端值
     print("验证配置文件字段强制覆盖:")

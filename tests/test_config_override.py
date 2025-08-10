@@ -10,8 +10,8 @@ import os
 import sys
 from unittest.mock import AsyncMock, patch
 
-# 添加当前目录到Python路径
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+# 添加src目录到Python路径
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'src'))
 
 # 导入相关函数
 from stt_proxy import load_config
@@ -22,14 +22,14 @@ def test_config_override_logic():
     print("测试配置文件强制覆盖逻辑...")
     
     # 加载配置文件
-    config = load_config("stt_config.json")
+    config = load_config("config/stt_config.json")
     print(f"配置文件内容: {config}")
     
     # 模拟客户端请求数据
     client_data = {
         "language": "en",  # 客户端提供的值
         "temperature": 0.8,  # 客户端提供的值
-        "prompt": "This is an English conversation.",  # 客户端提供的值
+        "initial_prompt": "This is an English conversation.",  # 客户端提供的值
         "model": "whisper-base",  # 客户端提供的值，但不在配置文件中
         "response_format": "json"  # 客户端提供的值
     }
@@ -51,9 +51,9 @@ def test_config_override_logic():
     expected_results = {
         "language": "zh",  # 应该被配置文件覆盖
         "temperature": 0.2,  # 应该被配置文件覆盖
-        "prompt": "以下是普通话的会议记录。",  # 应该被配置文件覆盖
+        "initial_prompt": "以下是一段普通话商务会议的录音，有多位发言人。转写需准确、流畅，并使用恰当的标点符号（例如逗号，句号，问号）进行断句。\n\n张总：嗯，关于上个季度提到的那个新方案，我们今天需要讨论一下具体的执行细节。\n李工：好的。我看了初步的计划，主要有两个问题想确认一下。第一个是资源方面，第二个是时间节点，这个我们能保证吗？\n张总：对，你提的这点很重要。下一步，我们必须先把风险点都梳理清楚。",  # 应该被配置文件覆盖
         "model": "whisper-base",  # 应该保持客户端值（不在配置文件中）
-        "response_format": "srt"  # 应该被配置文件覆盖
+        "response_format": "json"  # 应该保持客户端值（不在配置文件中）
     }
     
     print(f"期望结果: {expected_results}")
@@ -76,7 +76,7 @@ def test_edge_cases():
     print("\n测试边界情况...")
     
     # 加载配置文件
-    config = load_config("stt_config.json")
+    config = load_config("config/stt_config.json")
     
     # 测试空客户端数据
     print("1. 测试空客户端数据:")

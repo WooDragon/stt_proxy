@@ -1,0 +1,10 @@
+{
+  "language": "zh",
+  "temperature": 0.1,
+  "max_new_tokens": 300,
+  "suppress_tokens": [50364],
+  "early_stopping": true,
+  "top_p": 0.9,
+  "condition_on_previous_text": false,
+  "initial_prompt": "以下是两人商务对话录音。请仔细识别不同声音并准确标注发言人。注意：当说话人发生变化时，必须换行并标注新的发言人。\n\n说话人1：我觉得这个方案还需要完善一下。\n说话人2：是的，你说得对，具体哪些地方需要调整？\n说话人1：主要是时间安排，我们可能需要更多准备时间。\n说话人2：好的，那我重新制定一个时间表。\n说话人1：行，麻烦你了。\n说话人2：不客气，应该的。"
+}

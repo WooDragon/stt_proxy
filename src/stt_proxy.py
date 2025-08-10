@@ -58,7 +58,7 @@ async def startup_event():
     global http_client, target_base_url, config
     
     # 获取配置文件路径
-    config_path = os.environ.get("STT_CONFIG_PATH", "stt_config.json")
+    config_path = os.environ.get("STT_CONFIG_PATH", "config/stt_config.json")
     config = load_config(config_path)
     logger.info(f"加载配置: {config}")
     
@@ -103,17 +103,31 @@ async def forward_request(request: Request, modified_form_data: dict = None, fil
     
     try:
         if request.method == "POST" and modified_form_data is not None:
+            # 添加调试日志
+            logger.info(f"转发POST请求到: {target_url}")
+            logger.info(f"发送的表单数据: {json.dumps(modified_form_data, indent=2, ensure_ascii=False)}")
+            if files:
+                logger.info(f"发送的文件数量: {len(files)}")
+            
+            # 对于multipart/form-data请求，移除Content-Type头让httpx自动设置
+            # 这样可以确保正确的boundary参数
+            multipart_headers = headers.copy()
+            multipart_headers.pop("content-type", None)
+            
             # 发送修改后的表单数据和文件
             response = await http_client.post(
                 target_url,
                 data=modified_form_data,
                 files=files,
-                headers=headers
+                headers=multipart_headers
             )
         else:
             # 直接转发请求
+            logger.info(f"直接转发{request.method}请求到: {target_url}")
             # 读取请求体
             body = await request.body()
+            if body:
+                logger.info(f"转发的请求体: {body}")
             
             # 转发请求
             response = await http_client.request(
@@ -132,8 +146,9 @@ async def forward_request(request: Request, modified_form_data: dict = None, fil
     except Exception as e:
         logger.error(f"转发请求失败: {e}")
         return Response(
-            content={"error": f"转发请求失败: {str(e)}"},
-            status_code=500
+            content=json.dumps({"error": f"转发请求失败: {str(e)}"}),
+            status_code=500,
+            media_type="application/json"
         )
 
 
@@ -188,7 +203,13 @@ async def handle_stt_request(request: Request) -> Response:
         # 分离文件和普通表单数据
         files = {}
         if "file" in form:
-            files["file"] = form["file"]
+            file_obj = form["file"]
+            # 正确处理UploadFile对象
+            file_content = await file_obj.read()
+            # 重置文件指针
+            await file_obj.seek(0)
+            # 构造文件元组 (filename, file_content, content_type)
+            files["file"] = (file_obj.filename, file_content, file_obj.content_type)
             # 从表单数据中移除文件
             form_data.pop("file", None)
         
@@ -196,11 +217,26 @@ async def handle_stt_request(request: Request) -> Response:
         for key, default_value in config.items():
             # 强制使用配置文件中的值，不论客户端是否提供
             old_value = form_data.get(key, "未提供")
-            form_data[key] = default_value
-            logger.info(f"强制设置参数 {key}: {old_value} -> {default_value}")
+            # 确保所有值都转换为字符串（multipart/form-data要求）
+            form_data[key] = str(default_value)
+            logger.info(f"强制设置参数 {key}: {old_value} -> {default_value} (类型: {type(default_value).__name__} -> str)")
         
-        logger.info(f"最终表单数据: {form_data}")
+        # 添加详细的调试日志
+        logger.info(f"=== STT请求参数处理完成 ===")
+        logger.info(f"配置文件强制覆盖的参数数量: {len(config)}")
+        logger.info(f"最终表单数据字段数量: {len(form_data)}")
         logger.info(f"文件数据: {len(files)} 个文件")
+        
+        # 分别显示配置参数和客户端参数
+        config_params = {k: v for k, v in form_data.items() if k in config}
+        client_params = {k: v for k, v in form_data.items() if k not in config}
+        
+        logger.info(f"配置参数 (强制覆盖): {json.dumps(config_params, indent=2, ensure_ascii=False)}")
+        if client_params:
+            logger.info(f"客户端参数 (保持原样): {json.dumps(client_params, indent=2, ensure_ascii=False)}")
+        
+        logger.info(f"发送到目标服务的完整表单数据: {json.dumps(form_data, indent=2, ensure_ascii=False)}")
+        logger.info(f"=== 开始转发请求到目标服务 ===")
         
         # 转发请求
         return await forward_request(request, form_data, files)
@@ -208,8 +244,9 @@ async def handle_stt_request(request: Request) -> Response:
     except Exception as e:
         logger.error(f"处理STT请求失败: {e}")
         return Response(
-            content={"error": f"处理STT请求失败: {str(e)}"},
-            status_code=500
+            content=json.dumps({"error": f"处理STT请求失败: {str(e)}"}),
+            status_code=500,
+            media_type="application/json"
         )
 
 
@@ -243,8 +280,8 @@ def build_parser():
     parser.add_argument(
         "--config",
         type=str,
-        default="stt_config.json",
-        help="Path to STT config file, defaults to stt_config.json",
+        default="config/stt_config.json",
+        help="Path to STT config file, defaults to config/stt_config.json",
     )
     return parser
 

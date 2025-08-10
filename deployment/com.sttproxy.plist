@@ -1,0 +1,35 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.sttproxy</string>
+    
+    <key>ProgramArguments</key>
+    <array>
+        <string>/Users/woodragon/Work/github/stt_proxy/venv/bin/python</string>
+        <string>/Users/woodragon/Work/github/stt_proxy/src/stt_proxy.py</string>
+    </array>
+    
+    <key>WorkingDirectory</key>
+    <string>/Users/woodragon/Work/github/stt_proxy</string>
+    
+    <key>RunAtLoad</key>
+    <true/>
+    
+    <key>KeepAlive</key>
+    <true/>
+    
+    <key>StandardOutPath</key>
+    <string>/Users/woodragon/Work/github/stt_proxy/logs/stt_proxy.log</string>
+    
+    <key>StandardErrorPath</key>
+    <string>/Users/woodragon/Work/github/stt_proxy/logs/stt_proxy_error.log</string>
+    
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/Users/woodragon/Work/github/stt_proxy/venv/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+    </dict>
+</dict>
+</plist>
