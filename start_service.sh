@@ -10,6 +10,9 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 mkdir -p "$SCRIPT_DIR/logs"
 set -a; source "$SCRIPT_DIR/.env" 2>/dev/null; set +a
 
+# 相对路径展开为绝对路径（HF_HUB_CACHE=./models → /abs/path/models）
+[[ "$HF_HUB_CACHE" == ./* ]] && export HF_HUB_CACHE="$SCRIPT_DIR/${HF_HUB_CACHE#./}"
+
 PORT="${PORT:-10241}"
 HOST="${HOST:-0.0.0.0}"
 LOG="$SCRIPT_DIR/logs/asr_service.log"

@@ -16,7 +16,7 @@ Client → mlx-audio server:10241 (Qwen3-ASR, 直接推理)
 
 核心依赖：
 - **mlx-audio** >=0.3.1：提供 FastAPI server + STT 推理
-- **Qwen3-ASR-1.7B-8bit**：中文 ASR 模型（HuggingFace，mlx-community 量化版）
+- **Qwen3-ASR-1.7B-8bit**：中文 ASR 模型（HuggingFace，mlx-community 量化版，缓存在项目本地 `models/`）
 
 ### 历史背景
 
@@ -25,7 +25,7 @@ Client → mlx-audio server:10241 (Qwen3-ASR, 直接推理)
 ## File Structure
 
 ```
-├── .env                    # 环境配置（MODEL, PORT, HOST）
+├── .env                    # 环境配置（MODEL, PORT, HOST, HF_HUB_CACHE）
 ├── .gitignore
 ├── requirements.txt        # Python 依赖
 ├── start_service.sh        # 手动启动（后台 nohup + 健康检查 + 预热）
@@ -85,6 +85,7 @@ curl http://localhost:10241/v1/models
 | `MODEL` | `mlx-community/Qwen3-ASR-1.7B-8bit` | HuggingFace 模型名 |
 | `PORT` | `10241` | 服务端口 |
 | `HOST` | `0.0.0.0` | 监听地址 |
+| `HF_HUB_CACHE` | `./models` | 模型缓存目录（脚本自动展开为绝对路径） |
 
 ## Deployment
 
@@ -112,4 +113,4 @@ curl http://localhost:10241/v1/models
 
 - **model 参数是必填的**：mlx-audio server 要求每个请求传 `model` 字段（HuggingFace 模型名）
 - **模型首次加载慢**：首次请求触发模型下载和 GPU 加载（10-30s），`start_service.sh` 包含预热步骤
-- **HuggingFace 缓存**：模型缓存在 `~/.cache/huggingface/hub/`
+- **模型缓存**：通过 `HF_HUB_CACHE` 配置在项目本地 `models/` 目录（已 gitignore）

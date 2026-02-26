@@ -14,7 +14,7 @@
 pip install -r requirements.txt
 ```
 
-首次使用时，模型会自动从 HuggingFace 下载到 `~/.cache/huggingface/hub/`（约 2.3GB）。
+首次使用时，模型会自动从 HuggingFace 下载到项目本地 `models/` 目录（约 2.3GB）。
 
 ## 快速启动
 
@@ -64,6 +64,7 @@ curl http://localhost:10241/v1/models
 | `MODEL` | `mlx-community/Qwen3-ASR-1.7B-8bit` | HuggingFace 模型名 |
 | `PORT` | `10241` | 服务端口 |
 | `HOST` | `0.0.0.0` | 监听地址 |
+| `HF_HUB_CACHE` | `./models` | 模型缓存目录 |
 
 ### 可选模型
 

@@ -62,9 +62,9 @@ rm ~/Library/LaunchAgents/com.sttproxy.plist
 
 ### 缓存位置
 
-HuggingFace 标准缓存路径：`~/.cache/huggingface/hub/`
+通过 `.env` 中的 `HF_HUB_CACHE=./models` 配置，模型缓存在项目本地 `models/` 目录下（已 gitignore）。
 
-模型目录命名格式：`models--mlx-community--Qwen3-ASR-1.7B-8bit`
+模型子目录命名格式：`models--mlx-community--Qwen3-ASR-1.7B-8bit`
 
 ### 模型选择
 
@@ -80,7 +80,7 @@ HuggingFace 标准缓存路径：`~/.cache/huggingface/hub/`
 如需预下载模型（离线环境）：
 
 ```bash
-huggingface-cli download mlx-community/Qwen3-ASR-1.7B-8bit
+HF_HUB_CACHE=./models huggingface-cli download mlx-community/Qwen3-ASR-1.7B-8bit
 ```
 
 ## 监控与健康检查
