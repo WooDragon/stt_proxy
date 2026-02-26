@@ -7,8 +7,10 @@ so uvicorn workers can re-import mlx_audio.server:app cleanly).
 Remove this wrapper when upstream fixes are merged.
 """
 
-import patches.audio_io_fix  # noqa: F401 — M4A pipe seek fix
+import patches
 
-import runpy
+patches.apply_all()
+
+import runpy  # noqa: E402
 
 runpy.run_module("mlx_audio.server", run_name="__main__", alter_sys=True)

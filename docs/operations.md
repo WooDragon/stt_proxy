@@ -149,10 +149,43 @@ Apple Silicon 各芯片推理速度预期（Qwen3-ASR-1.7B-8bit）：
 | Patch | 修复 | 影响版本 | 移除条件 |
 |-------|------|----------|----------|
 | `audio_io_fix.py` | M4A/AAC 文件 pipe stdin 不可 seek 导致 ffmpeg 解码 0 采样点 | <=0.3.1 | 上游 `_decode_ffmpeg` 改为 tempfile |
+| `generate_enhance.py` | language 默认 Chinese（原 English）；注入 repetition_penalty 抑制重复幻觉；回填 STTOutput.language | <=0.3.1 | 上游修正默认 language 且回填 output.language |
+| `vad_chunking.py` | 用 webrtcvad 在 >=500ms 静音处切分音频（原能量最低点切割常把句子切断） | <=0.3.1 | 上游 `split_audio_into_chunks` 采用 VAD 分段 |
 
-**启动链路**：`start_service.sh` / `scripts/run_server.sh` → `run_server.py`（注入 patches）→ `mlx_audio.server`
+**Patch 管理**：`patches/__init__.py` 的 `apply_all()` 统一加载所有 patch，`run_server.py` 调用后再启动 server。各 patch 目标不同模块，加载顺序无关。
+
+**启动链路**：`start_service.sh` / `scripts/run_server.sh` → `run_server.py`（`patches.apply_all()`）→ `mlx_audio.server`
 
 **`--workers 1` 约束**：mlx-audio 默认 `workers=2`，但 macOS Python 的 `multiprocessing` 使用 spawn 模式（非 fork），子进程不继承 monkey-patch。单 GPU 推理也无需多 worker，因此强制 `--workers 1`。
+
+### generate_enhance.py 运维
+
+`REPETITION_PENALTY` 环境变量控制重复抑制强度（`.env` 中配置）：
+
+| 值 | 效果 |
+|----|------|
+| `1.0` | 禁用（不做惩罚） |
+| `1.05-1.1` | 轻度抑制（推荐，不影响正常重复词如"谢谢"） |
+| `1.2+` | 强力抑制（可能影响正常重复） |
+
+修改后重启服务生效。
+
+### vad_chunking.py 运维
+
+VAD 分段参数为代码内置常量（无需运维调参）：
+
+| 参数 | 值 | 说明 |
+|------|----|------|
+| VAD 模式 | 3（最激进） | webrtcvad 0-3，越高越激进判断非语音 |
+| 帧长 | 30ms | webrtcvad 标准帧长 |
+| 静音阈值 | 500ms | >= 500ms 连续非语音才视为切分点 |
+| 采样率 | 16kHz | VAD 分析固定 16kHz（非 16kHz 输入自动重采样） |
+
+chunk_duration（HTTP API 参数，server 默认 30s）作为单段绝对上限，VAD 在其范围内找最近静音切点。无静音切点时回退到原始能量分段。
+
+### 已知上游默认值限制
+
+`server.py` HTTP endpoint 默认 `max_tokens=128`（`generate()` 本身默认 8192）。对长段转写可能截断。无法在 patch 中安全覆盖（无法区分用户显式传值 vs server 默认）。如遇截断，客户端请求时显式传 `max_tokens=2048` 或更高。
 
 ## 升级流程
 

@@ -32,8 +32,10 @@ Client → mlx-audio server:10241 (Qwen3-ASR, 直接推理)
 ├── start_service.sh        # 手动启动（后台 nohup + 健康检查 + 预热）
 ├── stop_service.sh         # 手动停止（SIGTERM + wait + SIGKILL）
 ├── patches/
-│   ├── __init__.py
-│   └── audio_io_fix.py     # M4A/AAC pipe seek bug 修复（mlx-audio <=0.3.1）
+│   ├── __init__.py         # apply_all() 统一加载所有 patches
+│   ├── audio_io_fix.py     # M4A/AAC pipe seek bug 修复（mlx-audio <=0.3.1）
+│   ├── generate_enhance.py # generate() 默认参数修正 + 重复抑制 + language 回填
+│   └── vad_chunking.py     # VAD 驱动音频分段（替换能量分段）
 ├── assets/
 │   └── silence.wav         # 0.5s 静音 WAV，模型预热用
 ├── scripts/
@@ -43,7 +45,8 @@ Client → mlx-audio server:10241 (Qwen3-ASR, 直接推理)
 ├── deployment/
 │   └── com.sttproxy.plist  # macOS LaunchAgent 配置
 ├── tests/
-│   └── test_service.py     # 黑盒端到端测试（需服务运行）
+│   ├── test_service.py     # 黑盒端到端测试（需服务运行）
+│   └── test_patches.py     # patches 单元测试（无需服务运行）
 ├── docs/
 │   └── operations.md       # 运维手册
 └── logs/                   # 运行时日志（.gitignore 排除）
@@ -90,6 +93,7 @@ curl http://localhost:10241/v1/models
 | `PORT` | `10241` | 服务端口 |
 | `HOST` | `0.0.0.0` | 监听地址 |
 | `HF_HUB_CACHE` | `./models` | 模型缓存目录（脚本自动展开为绝对路径） |
+| `REPETITION_PENALTY` | `1.1` | 重复惩罚系数（1.0=禁用，中文建议 1.05-1.2） |
 
 ## Deployment
 
@@ -102,16 +106,18 @@ curl http://localhost:10241/v1/models
 
 ## Testing Strategy
 
-`tests/test_service.py` 是纯黑盒端到端测试：
-- 不 mock 第三方库内部
-- 直接向运行中的服务发 HTTP 请求
+两层测试：
+
+### 单元测试（`tests/test_patches.py`）
+- 无需运行中的服务
+- 测试 patch 逻辑隔离正确性：VAD 切分边界、尾帧安全、默认参数注入、language 回填
+- `pytest tests/test_patches.py -v`
+
+### 端到端测试（`tests/test_service.py`）
+- 纯黑盒：不 mock 第三方库内部，直接向运行中的服务发 HTTP 请求
 - 服务未运行时自动跳过（`pytest.mark.skipif`）
 - 标记为 `@pytest.mark.integration`
-
-测试覆盖：
-- `GET /v1/models` 返回正确 JSON
-- `POST /v1/audio/transcriptions` 接受 multipart/form-data 返回 `{"text": "..."}`
-- 参数校验（缺少 model/file 返回 422）
+- 覆盖：`GET /v1/models`、`POST /v1/audio/transcriptions`、参数校验（422）
 
 ## Key Notes
 
@@ -120,3 +126,4 @@ curl http://localhost:10241/v1/models
 - **模型缓存**：通过 `HF_HUB_CACHE` 配置在项目本地 `models/` 目录（已 gitignore）
 - **必须通过 run_server.py 启动**：直接 `python -m mlx_audio.server` 不会加载 patches，M4A/AAC 文件会失败
 - **--workers 1 是必须的**：macOS Python multiprocessing 使用 spawn 模式，多 worker 进程不继承 monkey-patch；且单 GPU 推理多 worker 无收益
+- **max_tokens=128 是 server 默认**：`server.py` 的 HTTP endpoint 默认 `max_tokens=128`（`generate()` 本身默认 8192）。对长段转写可能截断，但无法在 patch 中安全覆盖（无法区分用户显式传值 vs server 默认，覆盖会破坏 API 契约）。如遇截断，客户端请求时显式传 `max_tokens=2048+`
