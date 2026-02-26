@@ -1,148 +1,103 @@
-# STT代理服务使用说明
+# 本地中文语音转写服务
 
-## 简介
+基于 [mlx-audio](https://github.com/Blaizzy/mlx-audio) + [Qwen3-ASR](https://huggingface.co/Qwen/Qwen3-ASR) 的本地语音转写服务，专为 Apple Silicon Mac 优化。
 
-STT代理服务是一个轻量级的代理层，用于为MLX Omni Server添加默认参数支持，特别是为Whisper语音转文字服务提供默认的prompt，以提高转写准确性。
+## 系统要求
 
-## 功能特性
+- macOS（Apple Silicon：M1/M2/M3/M4 系列）
+- Python 3.11+
+- 约 4GB 可用内存（统一内存）
 
-1. **默认参数增强**：通过配置文件为STT请求自动添加默认参数
-2. **透明代理**：对客户端完全透明，无需修改客户端代码
-3. **性能优化**：使用连接池和HTTP/2优化性能
-4. **监控统计**：提供健康检查和请求统计功能
-5. **灵活配置**：支持通过配置文件自定义默认参数
-
-## 部署架构
-
-```
-客户端 -> STT代理服务(10241) -> MLX Omni Server(10240)
-```
-
-## 快速开始
-
-### 1. 启动MLX Omni Server
+## 安装
 
 ```bash
-# 在端口10240上启动MLX Omni Server
-mlx-omni-server --port 10240
+pip install -r requirements.txt
 ```
 
-### 2. 启动STT代理服务
+首次使用时，模型会自动从 HuggingFace 下载到 `~/.cache/huggingface/hub/`（约 2.3GB）。
+
+## 快速启动
 
 ```bash
-# 在端口10241上启动代理服务
-python stt_proxy.py
+# 启动服务（后台运行 + 自动预热模型）
+./start_service.sh
+
+# 停止服务
+./stop_service.sh
 ```
 
-### 3. 使用代理服务
+## API 使用
 
-将客户端请求发送到代理服务端口(10241)，而不是直接发送到MLX Omni Server(10240)。
+服务提供 OpenAI 兼容的 API 接口。
 
-## 配置文件
+### 转写音频
 
-### stt_config.json
+```bash
+curl -X POST http://localhost:10241/v1/audio/transcriptions \
+  -F file=@audio.wav \
+  -F model=mlx-community/Qwen3-ASR-1.7B-8bit
+```
+
+响应格式：
 
 ```json
 {
-  "language": "zh",
-  "temperature": 0.2,
-  "prompt": "以下是普通话的会议记录。",
-  "response_format": "srt"
+  "text": "转写的文本内容",
+  "segments": [
+    {"text": "分段文本", "start": 0.0, "end": 2.5}
+  ]
 }
 ```
 
-当客户端未提供相应参数时，代理服务会自动使用配置文件中的默认值。
-
-## 命令行参数
+### 查看已加载模型
 
 ```bash
-python stt_proxy.py --help
+curl http://localhost:10241/v1/models
 ```
 
-支持的参数：
-- `--host`: 代理服务监听的主机地址 (默认: 0.0.0.0)
-- `--port`: 代理服务监听的端口 (默认: 10241)
-- `--target-host`: 目标MLX Omni Server主机地址 (默认: localhost)
-- `--target-port`: 目标MLX Omni Server端口 (默认: 10240)
-- `--config`: 配置文件路径 (默认: stt_config.json)
+## 配置
 
-## 环境变量
+环境变量在 `.env` 文件中配置（参考 `.env.example`）：
 
-- `STT_CONFIG_PATH`: 配置文件路径
-- `TARGET_HOST`: 目标服务主机地址
-- `TARGET_PORT`: 目标服务端口
+| 变量 | 默认值 | 说明 |
+|------|--------|------|
+| `MODEL` | `mlx-community/Qwen3-ASR-1.7B-8bit` | HuggingFace 模型名 |
+| `PORT` | `10241` | 服务端口 |
+| `HOST` | `0.0.0.0` | 监听地址 |
 
-## 监控端点
+### 可选模型
 
-- `/health`: 健康检查端点
-- `/stats`: 请求统计信息端点
+| 模型 | 大小 | 适用场景 |
+|------|------|----------|
+| `mlx-community/Qwen3-ASR-0.6B-8bit` | ~1GB | 低内存设备，速度优先 |
+| `mlx-community/Qwen3-ASR-1.7B-8bit` | ~2.3GB | 推荐，精度与速度平衡 |
 
-## 性能优化
+## 支持的音频格式
 
-1. **连接池**: 使用httpx连接池复用连接
-2. **HTTP/2**: 启用HTTP/2以提高性能
-3. **Keep-Alive**: 配置keep-alive连接保持
-4. **禁用文档**: 禁用FastAPI自动生成的文档页面以减少资源消耗
+mlx-audio 通过 ffmpeg 解码，支持常见音频格式：WAV、MP3、FLAC、M4A、OGG 等。
 
-## 使用示例
-
-### Python客户端示例
-
-```python
-import httpx
-
-# 使用代理服务而不是直接连接到MLX Omni Server
-async with httpx.AsyncClient() as client:
-    with open("audio.wav", "rb") as f:
-        files = {"file": ("audio.wav", f, "audio/wav")}
-        data = {
-            "model": "whisper-tiny",
-            # 注意：不需要提供prompt，代理会自动添加默认prompt
-        }
-        
-        response = await client.post(
-            "http://localhost:10241/v1/audio/transcriptions",
-            files=files,
-            data=data
-        )
-```
-
-### curl示例
+## 测试
 
 ```bash
-# 使用代理服务
-curl -X POST http://localhost:10241/v1/audio/transcriptions \
-  -H "Content-Type: multipart/form-data" \
-  -F "file=@audio.wav" \
-  -F "model=whisper-tiny"
+# 端到端测试（需要服务运行中）
+pytest tests/ -v
+
+# 发送测试请求
+python scripts/send_test_request.py audio.wav
 ```
 
-## 参数处理规则
+## 常见问题
 
-1. **配置文件中存在的字段**：强制覆盖客户端发送的值
-2. **配置文件中不存在的字段**：直接透传客户端参数
-3. **客户端显式提供的参数**：对于配置文件中未定义的字段，保持客户端参数不变
+**Q: 首次请求很慢？**
+A: 首次请求触发模型加载到 GPU 内存（约 10-30s）。`start_service.sh` 包含自动预热，后续请求正常速度。
 
-## 更新和维护
+**Q: 如何切换模型？**
+A: 修改 `.env` 中的 `MODEL` 变量，重启服务即可。
 
-由于代理服务是独立于MLX Omni Server的，因此：
-1. 可以独立更新代理服务而不影响原始服务
-2. MLX Omni Server可以正常更新而无需修改
-3. 配置文件可以随时修改以调整默认行为
+**Q: 内存不够？**
+A: 1.7B-8bit 需要约 4GB 可用内存。如果不够，换用 0.6B 模型。
 
-## 故障排除
+**Q: 模型下载失败？**
+A: 检查网络连接。如需代理，设置 `HTTPS_PROXY` 环境变量。也可使用 HuggingFace 镜像：`HF_ENDPOINT=https://hf-mirror.com`。
 
-1. **代理服务无法启动**：
-   - 检查端口是否被占用
-   - 检查配置文件格式是否正确
-   - 检查目标服务是否可访问
-
-2. **STT请求失败**：
-   - 检查MLX Omni Server是否正常运行
-   - 检查配置文件中的模型是否存在
-   - 查看日志获取更多信息
-
-3. **性能问题**：
-   - 检查网络连接
-   - 调整连接池参数
-   - 检查目标服务性能
+详细运维指南见 [docs/operations.md](docs/operations.md)。

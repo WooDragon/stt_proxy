@@ -1,0 +1,1 @@
+mlx-audio[stt]>=0.3.1

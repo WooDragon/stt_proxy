@@ -1,0 +1,22 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+# 虚拟环境
+venv/
+.venv/
+
+# 环境配置（含端口和模型名，不含密钥，但各机器不同）
+.env
+
+# 日志
+logs/*.log
+
+# macOS
+.DS_Store
+
+# IDE
+.idea/
+.vscode/
+*.swp
