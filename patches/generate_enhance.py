@@ -14,7 +14,7 @@ import os
 
 from mlx_audio.stt.models.qwen3_asr.qwen3_asr import Qwen3ASRModel
 
-_DEFAULT_REPETITION_PENALTY = float(os.getenv("REPETITION_PENALTY", "1.1"))
+_DEFAULT_REPETITION_PENALTY = float(os.getenv("REPETITION_PENALTY", "1.2"))
 
 _original_generate = Qwen3ASRModel.generate
 

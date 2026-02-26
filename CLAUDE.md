@@ -93,7 +93,7 @@ curl http://localhost:10241/v1/models
 | `PORT` | `10241` | 服务端口 |
 | `HOST` | `0.0.0.0` | 监听地址 |
 | `HF_HUB_CACHE` | `./models` | 模型缓存目录（脚本自动展开为绝对路径） |
-| `REPETITION_PENALTY` | `1.1` | 重复惩罚系数（1.0=禁用，中文建议 1.05-1.2） |
+| `REPETITION_PENALTY` | `1.2` | 重复惩罚系数（1.0=禁用，中文建议 1.1-1.3） |
 
 ## Deployment
 
