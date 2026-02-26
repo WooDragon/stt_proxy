@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-本地中文语音转写服务，基于 mlx-audio + Qwen3-ASR，运行在 Apple Silicon Mac 上。零自定义代码——mlx-audio 原生提供 OpenAI 兼容的 FastAPI server，项目只包含启动脚本、部署配置和测试。
+本地中文语音转写服务，基于 mlx-audio + Qwen3-ASR，运行在 Apple Silicon Mac 上。mlx-audio 原生提供 OpenAI 兼容的 FastAPI server，项目包含启动脚本、部署配置、测试和本地 monkey-patch（修复 mlx-audio 已知 bug）。
 
 ## Architecture
 
@@ -28,8 +28,12 @@ Client → mlx-audio server:10241 (Qwen3-ASR, 直接推理)
 ├── .env                    # 环境配置（MODEL, PORT, HOST, HF_HUB_CACHE）
 ├── .gitignore
 ├── requirements.txt        # Python 依赖
+├── run_server.py           # 启动入口（注入 patches 后委托 mlx_audio.server）
 ├── start_service.sh        # 手动启动（后台 nohup + 健康检查 + 预热）
 ├── stop_service.sh         # 手动停止（SIGTERM + wait + SIGKILL）
+├── patches/
+│   ├── __init__.py
+│   └── audio_io_fix.py     # M4A/AAC pipe seek bug 修复（mlx-audio <=0.3.1）
 ├── assets/
 │   └── silence.wav         # 0.5s 静音 WAV，模型预热用
 ├── scripts/
@@ -56,8 +60,8 @@ Client → mlx-audio server:10241 (Qwen3-ASR, 直接推理)
 # 停止服务
 ./stop_service.sh
 
-# 手动前台启动（调试用）
-python -m mlx_audio.server --host 0.0.0.0 --port 10241
+# 手动前台启动（调试用，必须通过 run_server.py 启动以加载 patches）
+python run_server.py --host 0.0.0.0 --port 10241 --workers 1
 ```
 
 ### Testing
@@ -114,3 +118,5 @@ curl http://localhost:10241/v1/models
 - **model 参数是必填的**：mlx-audio server 要求每个请求传 `model` 字段（HuggingFace 模型名）
 - **模型首次加载慢**：首次请求触发模型下载和 GPU 加载（10-30s），`start_service.sh` 包含预热步骤
 - **模型缓存**：通过 `HF_HUB_CACHE` 配置在项目本地 `models/` 目录（已 gitignore）
+- **必须通过 run_server.py 启动**：直接 `python -m mlx_audio.server` 不会加载 patches，M4A/AAC 文件会失败
+- **--workers 1 是必须的**：macOS Python multiprocessing 使用 spawn 模式，多 worker 进程不继承 monkey-patch；且单 GPU 推理多 worker 无收益

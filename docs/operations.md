@@ -8,7 +8,7 @@
 Client → mlx-audio server:10241 (Qwen3-ASR, 直接推理)
 ```
 
-无代理层、无自定义代码。mlx-audio 原生提供 FastAPI server。
+项目包含本地 monkey-patch（`patches/`）修复 mlx-audio 已知 bug，通过 `run_server.py` 在启动时注入。
 
 ## 部署方式
 
@@ -127,7 +127,7 @@ Apple Silicon 使用统一内存，GPU 和 CPU 共享。1.7B-8bit 模型运行�
 `start_service.sh` 等待 60 秒。如果超时：
 1. 检查日志 `logs/asr_service.log`
 2. 确认 Python 环境正确（`which python` 应指向安装了 mlx-audio 的环境）
-3. 手动启动测试：`python -m mlx_audio.server --port 10241`
+3. 手动启动测试：`python run_server.py --host 0.0.0.0 --port 10241 --workers 1`
 
 ## 性能参考
 
@@ -142,6 +142,18 @@ Apple Silicon 各芯片推理速度预期（Qwen3-ASR-1.7B-8bit）：
 
 实时倍率 = 音频时长 / 处理时间。10x 表示 10 秒音频约 1 秒处理完。
 
+## 本地 Patches
+
+`patches/` 目录包含对 mlx-audio 的 monkey-patch，通过 `run_server.py` 在启动时注入：
+
+| Patch | 修复 | 影响版本 | 移除条件 |
+|-------|------|----------|----------|
+| `audio_io_fix.py` | M4A/AAC 文件 pipe stdin 不可 seek 导致 ffmpeg 解码 0 采样点 | <=0.3.1 | 上游 `_decode_ffmpeg` 改为 tempfile |
+
+**启动链路**：`start_service.sh` / `scripts/run_server.sh` → `run_server.py`（注入 patches）→ `mlx_audio.server`
+
+**`--workers 1` 约束**：mlx-audio 默认 `workers=2`，但 macOS Python 的 `multiprocessing` 使用 spawn 模式（非 fork），子进程不继承 monkey-patch。单 GPU 推理也无需多 worker，因此强制 `--workers 1`。
+
 ## 升级流程
 
 ```bash
@@ -151,7 +163,10 @@ Apple Silicon 各芯片推理速度预期（Qwen3-ASR-1.7B-8bit）：
 # 2. 升级 mlx-audio
 pip install -r requirements.txt --upgrade
 
-# 3. 启动服务
+# 3. 检查 patches 是否仍需要（查看 CHANGELOG 或测试 m4a 文件）
+# 如上游已修复，可移除 patches/ 和 run_server.py，恢复 python -m mlx_audio.server
+
+# 4. 启动服务
 ./start_service.sh
 ```
 

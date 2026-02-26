@@ -24,10 +24,12 @@ if lsof -i :"$PORT" -sTCP:LISTEN > /dev/null 2>&1; then
   exit 1
 fi
 
-# 后台启动 mlx-audio server
-nohup python -m mlx_audio.server \
+# 后台启动 mlx-audio server（通过 run_server.py 注入本地 patches）
+# --workers 1: 单 GPU 推理无需多 worker，且保证 monkey-patch 在请求处理进程内生效
+nohup python "$SCRIPT_DIR/run_server.py" \
   --host "$HOST" \
   --port "$PORT" \
+  --workers 1 \
   > "$LOG" 2>&1 &
 
 PID=$!
