@@ -98,7 +98,161 @@ curl -sf http://localhost:10241/v1/models && echo "OK" || echo "FAIL"
   - stdout: `logs/asr_service.log`
   - stderr: `logs/asr_service_error.log`
 
+### Apple Silicon 硬件监控
+
+#### 快速状态（无需 sudo）
+
+```bash
+# 进程 CPU/内存
+ps -p $(pgrep -f run_server.py) -o pid,pcpu,pmem,rss=
+
+# GPU Metal 利用率（注意：只反映渲染管线，不含 MLX compute，见下方说明）
+python3 -c "
+import subprocess, re
+r = subprocess.run(['ioreg', '-r', '-c', 'IOAccelerator', '-d', '1'], capture_output=True, text=True)
+m = re.search(r'\"PerformanceStatistics\" = \{(.+?)\}', r.stdout)
+if m:
+    s = {k.strip('\" '): v.strip('\" ') for i in m.group(1).split(',') for k,v in [i.split('=',1)] if '=' in i}
+    print(f'Device={s.get(\"Device Utilization %\")}%  VRAM={int(s.get(\"In use system memory\",0))//1024//1024}MB')
+"
+
+# ANE（Apple Neural Engine）激活状态
+python3 -c "
+import subprocess, re
+r = subprocess.run(['ioreg', '-r', '-c', 'H11ANEIn', '-d', '1'], capture_output=True, text=True)
+m = re.search(r'\"DevicePowerState\"=(\d+)', r.stdout)
+print('ANE:', 'ACTIVE' if m and int(m.group(1)) > 0 else 'idle')
+"
+```
+
+#### 持续监控脚本（60秒采样，200ms 间隔）
+
+```bash
+python3 - $(pgrep -f run_server.py) << 'EOF'
+import subprocess, re, time, sys
+PID = int(sys.argv[1])
+
+def gpu():
+    r = subprocess.run(['ioreg','-r','-c','IOAccelerator','-d','1'], capture_output=True, text=True)
+    m = re.search(r'"PerformanceStatistics" = \{(.+?)\}', r.stdout)
+    if not m: return 0, 0
+    s = {k.strip(' "'): v.strip(' "') for i in m.group(1).split(',') for k,v in [i.split('=',1)] if '=' in i}
+    return int(s.get('Device Utilization %',0)), int(s.get('In use system memory',0))//1024//1024
+
+def ane():
+    r = subprocess.run(['ioreg','-r','-c','H11ANEIn','-d','1'], capture_output=True, text=True)
+    m = re.search(r'"DevicePowerState"=(\d+)', r.stdout)
+    return int(m.group(1)) > 0 if m else False
+
+def proc(pid):
+    r = subprocess.run(['ps','-p',str(pid),'-o','pcpu=,pmem=,rss='], capture_output=True, text=True)
+    p = r.stdout.strip().split()
+    return (float(p[0]), float(p[1]), int(p[2])//1024) if p else (0,0,0)
+
+print(f"{'时间':8s} {'GPU%':5s} {'VRAM':6s} {'ANE':6s} {'CPU%':6s} {'RSS MB':7s}")
+for _ in range(300):
+    dev, vram = gpu()
+    ane_on = ane()
+    cpu, mem, rss = proc(PID)
+    flag = "← GPU" if dev > 0 else ("← ANE" if ane_on else "")
+    print(f"{time.strftime('%H:%M:%S')} {dev:5d} {vram:5d}MB {'ACTIVE' if ane_on else 'idle':6s} {cpu:6.1f} {rss:7d}  {flag}")
+    sys.stdout.flush()
+    time.sleep(0.2)
+EOF
+```
+
+#### GPU compute 利用率（需要 sudo）
+
+`ioreg` 的 `Device Utilization %` 仅追踪 Metal **渲染管线**（图形），MLX 使用 Metal **Compute Shader**，不计入该指标。真实 GPU compute 占用需要：
+
+```bash
+# 需要 sudo，每秒采样一次，共 5 次
+sudo powermetrics --samplers gpu_power -n 5 -i 1000
+```
+
+或打开 **Activity Monitor → Window → GPU History** 用 GUI 观察。
+
+#### 硬件分工说明
+
+| 组件 | 硬件 | 监控方式 |
+|------|------|---------|
+| Qwen3-ASR MLX 推理 | Metal GPU（所有 GPU 核心） | `sudo powermetrics` 或 Activity Monitor |
+| WeSpeaker CoreML embedding | ANE（Apple Neural Engine） | `ioreg H11ANEIn DevicePowerState` |
+| VAD / fbank / AHC 聚类 | CPU | `ps -o pcpu` |
+
+**重要**：MLX 推理调度方式是单次推理横向铺满所有 GPU 核心，不支持多任务并行占不同核心。并发请求在 GPU 层串行执行，workers=1 是正确配置（详见并发限制章节）。
+
+### 并发能力与扩容限制
+
+**M1 8GB 配置下，单 worker 是客观最优：**
+
+| 场景 | 分析 |
+|------|------|
+| workers=1（当前） | 请求串行处理，GPU 100% 利用率，内存可控 |
+| workers=2（假设） | 需要 2×5-6GB RSS ≈ 12GB，超出 M1 8GB 物理内存上限，OOM |
+| GPU 核心分配 | MLX 每次推理占满全部 GPU 核（Metal 横向 dispatch），不是"1核/任务" |
+| Metal 并发 | 多进程争用 GPU 时 Metal command queue 串行执行，速度不提升 |
+
+要支持多路并发转写，瓶颈是**内存**，不是 GPU 核心数：
+- M1 Pro 16GB：理论支持 2 worker（各用 ~6GB）
+- M1 Max 32GB / M1 Ultra 64GB：可支持 4-8 worker
+- 即使内存充足，Metal GPU 命令队列仍串行，实际提速受限于 GPU 总吞吐
+
+## HTTP 错误码参考
+
+| 状态码 | 含义 | 客户端处理 | 示例场景 |
+|--------|------|-----------|----------|
+| 200 | 成功 | 正常处理 | — |
+| 400 | 请求参数冲突 | 修正请求 | `stream=true` + `diarize=true` |
+| 413 | 上传文件超限 | 分段或压缩 | 文件大小超过 `MAX_UPLOAD_BYTES`（默认 500MB） |
+| 422 | 请求格式/内容无效 | 跳过该文件 | 缺少 `model` 参数；坏音频文件（格式不支持、解码失败） |
+| 500 | 服务内部错误 | 等待后重试 | ffmpeg 未安装、模型加载失败、未知异常 |
+
+422 中的音频解码错误 detail 以 `"Audio decode failed: "` 开头，包含具体异常信息。批量处理客户端可据此区分"跳过坏文件"和"等待服务恢复"。
+
+413 的 detail 格式为 `"Upload exceeds N bytes limit"`。客户端应在上传前检查文件大小，或对超长录音做分段处理。
+
+## 大文件转写最佳实践
+
+### stream=false 的超时风险
+
+`stream=false`（默认）在整个推理完成前不发送任何数据。254MB M4A（3-4 小时音频）推理需 26-42 分钟，期间客户端收不到任何字节。若客户端配置了 read timeout，连接会在推理完成前被客户端关闭，服务端随后发响应时遇 broken pipe——客户端显示 "Server disconnected"，access log 记录 200（服务端逻辑完全正确）。
+
+**解决方案**：
+
+```bash
+# 推荐：stream=true（逐 chunk 接收，无超时风险）
+curl -X POST http://localhost:10241/v1/audio/transcriptions \
+  -F "file=@long_audio.m4a" \
+  -F "model=mlx-community/Qwen3-ASR-1.7B-8bit" \
+  -F "stream=true" \
+  --no-buffer
+
+# 备选：stream=false + 足够长的 --max-time（秒）
+# 3-4 小时音频建议至少 7200s（2 小时）余量
+curl -X POST http://localhost:10241/v1/audio/transcriptions \
+  -F "file=@long_audio.m4a" \
+  -F "model=mlx-community/Qwen3-ASR-1.7B-8bit" \
+  --max-time 7200
+```
+
+**经验法则**：音频时长超过 10 分钟，优先使用 `stream=true`。
+
+### max_tokens 与转写截断
+
+`server_diarize.py` wrapper 默认 `max_tokens=8192`（与 `generate()` 本身一致），不会截断长音频。若使用旧版本服务（默认 128），长音频每 chunk 最多输出 128 token，会明显截断——升级即可解决。
+
 ## 故障排查
+
+### Server disconnected（客户端侧）
+
+**症状**：客户端报 "Server disconnected" / "Connection reset"，服务端 access log 显示 200。
+
+**根因**：客户端 read timeout 触发 TCP 关闭，服务端推理完成后发响应时遇 broken pipe。服务端逻辑完全正确。
+
+**解决**：
+1. 改用 `stream=true`（推荐，逐 chunk 接收，无超时风险）
+2. 增大客户端 read timeout / `--max-time`（至少覆盖估计推理时长）
 
 ### 端口占用
 
@@ -121,6 +275,20 @@ Apple Silicon 使用统一内存，GPU 和 CPU 共享。1.7B-8bit 模型运行�
 解决：
 1. 关闭其他占用内存的应用
 2. 换用 0.6B 模型
+
+#### 大文件内存估算
+
+上传文件经 tempfile spool → 单次 `model.generate(path)` 解码（不再有 double-decode）：
+
+| 阶段 | 内存占用 | 说明 |
+|------|---------|------|
+| Upload spool | ~0（磁盘 I/O） | 64KB 分块写 tempfile，不在内存中累积 |
+| ffmpeg decode 瞬时 | ~文件时长×SR×8B | `capture_output=True` + float64 转换 |
+| 推理稳态 | ~2.5GB | model 1.7GB + 单 chunk PCM + KV cache |
+
+200MB M4A（约 3.5h）示例：瞬时峰值 ~6.6GB（ffmpeg capture_output），稳态 ~2.5GB。8GB Mac 可正常运行。
+
+**历史对比**：v0.3.x 以前，原始 handler 做 decode→reencode→decode（double-decode），200MB M4A 峰值 ~13GB，8GB Mac 必定 OOM。
 
 ### 服务启动超时
 
@@ -184,9 +352,132 @@ VAD 分段参数为代码内置常量（无需运维调参）：
 
 chunk_duration（HTTP API 参数，server 默认 30s）作为单段绝对上限，VAD 在其范围内找最近静音切点。无静音切点时回退到原始能量分段。
 
-### 已知上游默认值限制
+### speaker_diarization.py + server_diarize.py 运维
 
-`server.py` HTTP endpoint 默认 `max_tokens=128`（`generate()` 本身默认 8192）。对长段转写可能截断。无法在 patch 中安全覆盖（无法区分用户显式传值 vs server 默认）。如遇截断，客户端请求时显式传 `max_tokens=2048` 或更高。
+Speaker diarization 基于 CoreML WeSpeaker ResNet34 embedding + AHC 聚类，在 Apple Silicon GPU/ANE 上运行。
+
+#### 前置条件：模型转换
+
+首次部署或 CoreML 模型丢失时，需运行离线转换脚本：
+
+```bash
+# 安装构建时依赖（不在 requirements.txt 中，仅转换用）
+pip install onnx onnx2torch
+
+# 运行转换（下载 ONNX → PyTorch → CoreML FP16）
+python scripts/convert_wespeaker.py
+
+# 验证
+ls -la models/wespeaker/wespeaker_resnet34_LM_fp16.mlpackage
+# 预期 ~12.7MB
+```
+
+转换完成后 `onnx` 和 `onnx2torch` 可卸载。运行时仅需 `coremltools`（已在环境中）。
+
+#### API 用法
+
+```bash
+# 常规转写（不变）
+curl -X POST http://localhost:10241/v1/audio/transcriptions \
+  -F "file=@audio.wav" \
+  -F "model=mlx-community/Qwen3-ASR-1.7B-8bit"
+
+# 带 speaker diarization
+curl -X POST http://localhost:10241/v1/audio/transcriptions \
+  -F "file=@audio.wav" \
+  -F "model=mlx-community/Qwen3-ASR-1.7B-8bit" \
+  -F "diarize=true"
+
+# 指定说话人数
+curl -X POST http://localhost:10241/v1/audio/transcriptions \
+  -F "file=@audio.wav" \
+  -F "model=mlx-community/Qwen3-ASR-1.7B-8bit" \
+  -F "diarize=true" \
+  -F "num_speakers=2"
+```
+
+Diarization 参数：
+
+| 参数 | 类型 | 默认 | 说明 |
+|------|------|------|------|
+| `diarize` | str | `"false"` | `"true"` 或 `"1"` 启用 |
+| `num_speakers` | int | null | 精确说话人数（覆盖自动检测） |
+| `min_speakers` | int | null | 说话人数下限 |
+| `max_speakers` | int | null | 说话人数上限 |
+
+**限制**：`stream=true` 与 `diarize=true` 不兼容（返回 HTTP 400）。Diarization 需要完整 ASR 结果后才能做时间对齐。
+
+#### 响应格式
+
+成功（diarize=true）：
+```json
+{
+    "text": "完整转写文本",
+    "segments": [
+        {"text": "...", "start": 0.0, "end": 2.5, "speaker": "SPEAKER_00"},
+        {"text": "...", "start": 2.5, "end": 5.0, "speaker": "SPEAKER_01"}
+    ],
+    "language": "Chinese",
+    "speakers": ["SPEAKER_00", "SPEAKER_01"]
+}
+```
+
+降级（diarization 失败时返回原始 ASR + 错误字段）：
+```json
+{
+    "text": "...",
+    "segments": [{"text": "...", "start": 0.0, "end": 2.5}],
+    "diarization_error": "CoreML model not found..."
+}
+```
+
+#### 配置
+
+`.env` 中的 diarization 配置：
+
+| 变量 | 默认值 | 说明 |
+|------|--------|------|
+| `WESPEAKER_CACHE` | `./models/wespeaker` | CoreML 模型目录 |
+| `DIARIZE_THRESHOLD` | `0.75` | AHC cosine distance 停止阈值（越小越倾向多 speaker） |
+| `MAX_UPLOAD_BYTES` | `524288000`（500MB） | 单次上传文件大小上限，超限返回 HTTP 413 |
+| `PYTHON_BIN` | （空，使用 PATH） | Python 解释器绝对路径（launchd/conda 环境下建议设置） |
+| `EXTRA_PATH` | `/opt/homebrew/bin:/usr/local/bin` | 额外 PATH 前缀（Homebrew ffmpeg 所需） |
+
+阈值调参指南（cosine distance = 1 - cosine_similarity）：
+
+| cosine distance | cosine similarity | 效果 |
+|:---:|:---:|:---|
+| `0.5` | `0.5` | 严格分裂（干净音频、多说话人场景） |
+| `0.75` | `0.25` | 推荐默认值（电话录音、2-5 人） |
+| `0.9` | `0.1` | 宽松合并（可能漏分 speaker） |
+
+#### 调参经验
+
+电话录音（窄带、压缩）的 WeSpeaker 1.5s 窗口 embedding cosine similarity 中位数仅 **0.24**，远低于干净音频。intra-speaker 和 inter-speaker 的 distance 分布严重重叠，单纯依赖 threshold 难以精确分离。
+
+**推荐策略**：
+
+| 场景 | 推荐配置 |
+|------|---------|
+| 电话录音（2 人） | 默认 `0.75` + 传 `max_speakers=2` |
+| 会议录音（干净多人） | `DIARIZE_THRESHOLD=0.50`~`0.60` |
+| 已知说话人数 | 传 `num_speakers=N`（跳过 threshold，走精确聚类） |
+
+**诊断**：如 speaker 数量异常，用 embedding pairwise cosine distance 分布分析定位阈值分界点（参考 `_cluster()` 中的 AHC 参数）。
+
+#### 故障排查
+
+| 症状 | 原因 | 解决 |
+|------|------|------|
+| 启动时 "CoreML model not found" | 模型未转换 | `python scripts/convert_wespeaker.py` |
+| diarization_error 字段出现 | CoreML 推理异常 | 检查日志，验证模型完整性 |
+| speaker 数量不准 | 阈值不适配 | 调整 `DIARIZE_THRESHOLD` 或传 `num_speakers` |
+| speaker 数量远超实际（如 40+） | `DIARIZE_THRESHOLD` 过低 | 调高阈值（如 0.5→0.7）；或传 `max_speakers` 设上限 |
+| 首次 diarize 请求慢 | CoreML 模型懒加载 | 正常行为，后续请求不受影响 |
+
+### max_tokens 默认值说明
+
+`server.py` 原始 endpoint 默认 `max_tokens=128`，但 `server_diarize.py` wrapper 已覆盖为 `max_tokens=8192`（与 `generate()` 本身一致），长音频不会因 token 上限截断。若客户端显式传 `max_tokens`，以客户端传值为准。
 
 ## 升级流程
 

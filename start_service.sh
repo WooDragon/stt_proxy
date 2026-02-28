@@ -10,8 +10,12 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 mkdir -p "$SCRIPT_DIR/logs"
 set -a; source "$SCRIPT_DIR/.env" 2>/dev/null; set +a
 
+# 应用额外 PATH（Homebrew ffmpeg 等依赖）
+[[ -n "$EXTRA_PATH" ]] && export PATH="$EXTRA_PATH:$PATH"
+
 # 相对路径展开为绝对路径（HF_HUB_CACHE=./models → /abs/path/models）
 [[ "$HF_HUB_CACHE" == ./* ]] && export HF_HUB_CACHE="$SCRIPT_DIR/${HF_HUB_CACHE#./}"
+[[ "$WESPEAKER_CACHE" == ./* ]] && export WESPEAKER_CACHE="$SCRIPT_DIR/${WESPEAKER_CACHE#./}"
 
 PORT="${PORT:-10241}"
 HOST="${HOST:-0.0.0.0}"
@@ -26,7 +30,8 @@ fi
 
 # 后台启动 mlx-audio server（通过 run_server.py 注入本地 patches）
 # --workers 1: 单 GPU 推理无需多 worker，且保证 monkey-patch 在请求处理进程内生效
-nohup python "$SCRIPT_DIR/run_server.py" \
+PYTHON="${PYTHON_BIN:-python3}"
+nohup "$PYTHON" "$SCRIPT_DIR/run_server.py" \
   --host "$HOST" \
   --port "$PORT" \
   --workers 1 \
