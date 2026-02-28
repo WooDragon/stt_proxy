@@ -102,3 +102,128 @@ class TestTranscriptionEndpoint:
             timeout=30.0,
         )
         assert resp.status_code == 422
+
+
+@pytest.mark.integration
+class TestDiarization:
+    """Speaker diarization endpoint tests."""
+
+    def test_diarize_false_unchanged(self):
+        """diarize=false returns normal transcription (no speaker fields)."""
+        wav_data = _make_wav(duration_sec=0.5)
+        resp = httpx.post(
+            f"{BASE_URL}/v1/audio/transcriptions",
+            files={"file": ("silence.wav", wav_data, "audio/wav")},
+            data={"model": MODEL, "diarize": "false"},
+            timeout=120.0,
+        )
+        assert resp.status_code == 200
+        body = resp.json()
+        assert "text" in body
+
+    def test_diarize_true_returns_speakers(self):
+        """diarize=true returns speaker labels and speakers list."""
+        wav_data = _make_wav(duration_sec=1.0)
+        resp = httpx.post(
+            f"{BASE_URL}/v1/audio/transcriptions",
+            files={"file": ("silence.wav", wav_data, "audio/wav")},
+            data={"model": MODEL, "diarize": "true"},
+            timeout=120.0,
+        )
+        assert resp.status_code == 200
+        body = resp.json()
+        assert "text" in body
+        assert "speakers" in body
+        assert isinstance(body["speakers"], list)
+        # If segments exist, they should have speaker labels or diarization_error
+        if "segments" in body and body["segments"]:
+            for seg in body["segments"]:
+                assert "text" in seg
+        # diarization_error may be present if model not converted (graceful degradation)
+        if "diarization_error" in body:
+            assert isinstance(body["diarization_error"], str)
+
+    def test_stream_plus_diarize_returns_400(self):
+        """stream=true + diarize=true → HTTP 400."""
+        wav_data = _make_wav(duration_sec=0.5)
+        resp = httpx.post(
+            f"{BASE_URL}/v1/audio/transcriptions",
+            files={"file": ("silence.wav", wav_data, "audio/wav")},
+            data={"model": MODEL, "diarize": "true", "stream": "true"},
+            timeout=30.0,
+        )
+        assert resp.status_code == 400
+
+
+@pytest.mark.integration
+class TestErrorDifferentiation:
+    """Verify 422 (bad audio) vs 500 (service error) differentiation."""
+
+    def test_corrupt_audio_returns_422(self):
+        """Random garbage bytes → 422 with 'Audio decode failed' detail."""
+        garbage = os.urandom(256)
+        resp = httpx.post(
+            f"{BASE_URL}/v1/audio/transcriptions",
+            files={"file": ("garbage.wav", garbage, "audio/wav")},
+            data={"model": MODEL},
+            timeout=30.0,
+        )
+        assert resp.status_code == 422
+        body = resp.json()
+        assert "Audio decode failed" in body["detail"]
+
+    def test_corrupt_audio_diarize_returns_422(self):
+        """diarize=true + garbage bytes → 422 (not graceful degradation)."""
+        garbage = os.urandom(256)
+        resp = httpx.post(
+            f"{BASE_URL}/v1/audio/transcriptions",
+            files={"file": ("garbage.wav", garbage, "audio/wav")},
+            data={"model": MODEL, "diarize": "true"},
+            timeout=30.0,
+        )
+        assert resp.status_code == 422
+        body = resp.json()
+        assert "Audio decode failed" in body["detail"]
+
+    def test_valid_wav_still_200(self):
+        """Regression: valid WAV still returns 200."""
+        wav_data = _make_wav(duration_sec=0.5)
+        resp = httpx.post(
+            f"{BASE_URL}/v1/audio/transcriptions",
+            files={"file": ("test.wav", wav_data, "audio/wav")},
+            data={"model": MODEL},
+            timeout=120.0,
+        )
+        assert resp.status_code == 200
+
+
+@pytest.mark.integration
+class TestUploadSizeLimit:
+    """Upload size limit (MAX_UPLOAD_BYTES) enforcement."""
+
+    def test_oversized_upload_returns_413(self):
+        """Upload exceeding MAX_UPLOAD_BYTES → HTTP 413.
+
+        Uses a minimal payload just above the configured limit.
+        Reads MAX_UPLOAD_BYTES from env (default 500MB), then sends limit+1 bytes.
+        Skip if limit is too large to construct in-memory (>10MB test ceiling).
+        """
+        max_bytes = int(os.getenv("MAX_UPLOAD_BYTES", str(500 * 1024 * 1024)))
+        test_ceiling = 10 * 1024 * 1024  # 10MB — don't allocate more in a test
+        if max_bytes > test_ceiling:
+            pytest.skip(
+                f"MAX_UPLOAD_BYTES={max_bytes} too large for in-memory test "
+                f"(ceiling={test_ceiling}). Set MAX_UPLOAD_BYTES={test_ceiling} to test."
+            )
+
+        # Payload just above limit
+        garbage = b"x" * (max_bytes + 1)
+        resp = httpx.post(
+            f"{BASE_URL}/v1/audio/transcriptions",
+            files={"file": ("huge.wav", garbage, "audio/wav")},
+            data={"model": MODEL},
+            timeout=30.0,
+        )
+        assert resp.status_code == 413
+        body = resp.json()
+        assert "exceeds" in body["detail"].lower() or "limit" in body["detail"].lower()

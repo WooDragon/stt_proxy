@@ -38,14 +38,31 @@ curl -X POST http://localhost:10241/v1/audio/transcriptions \
   -F model=mlx-community/Qwen3-ASR-1.7B-8bit
 ```
 
+### 多说话人分离（Speaker Diarization）
+
+```bash
+curl -X POST http://localhost:10241/v1/audio/transcriptions \
+  -F file=@meeting.wav \
+  -F model=mlx-community/Qwen3-ASR-1.7B-8bit \
+  -F diarize=true
+```
+
+首次使用前需转换 speaker embedding 模型（一次性）：
+
+```bash
+pip install onnx onnx2torch
+python scripts/convert_wespeaker.py
+```
+
 响应格式：
 
 ```json
 {
   "text": "转写的文本内容",
   "segments": [
-    {"text": "分段文本", "start": 0.0, "end": 2.5}
-  ]
+    {"text": "分段文本", "start": 0.0, "end": 2.5, "speaker": "SPEAKER_00"}
+  ],
+  "speakers": ["SPEAKER_00", "SPEAKER_01"]
 }
 ```
 
@@ -65,6 +82,9 @@ curl http://localhost:10241/v1/models
 | `PORT` | `10241` | 服务端口 |
 | `HOST` | `0.0.0.0` | 监听地址 |
 | `HF_HUB_CACHE` | `./models` | 模型缓存目录 |
+| `REPETITION_PENALTY` | `1.2` | 重复惩罚系数（1.0=禁用） |
+| `WESPEAKER_CACHE` | `./models/wespeaker` | CoreML speaker 模型目录 |
+| `DIARIZE_THRESHOLD` | `0.7` | 聚类阈值（越小→越多 speaker） |
 
 ### 可选模型
 
