@@ -120,6 +120,7 @@ curl http://localhost:10241/v1/models
 | `WESPEAKER_CACHE` | `./models/wespeaker` | CoreML speaker embedding 模型目录 |
 | `DIARIZE_THRESHOLD` | `0.75` | AHC cosine distance 聚类阈值 |
 | `MAX_UPLOAD_BYTES` | `524288000`（500MB） | 单次上传大小上限，超限返回 413 |
+| `GPU_LOCK_TIMEOUT` | `300` | GPU 锁获取超时秒数；超时返回 HTTP 503（不崩溃） |
 | `PYTHON_BIN` | （空，使用 PATH） | Python 解释器绝对路径（launchd/conda 环境下建议设置） |
 | `EXTRA_PATH` | `/opt/homebrew/bin:/usr/local/bin` | 额外 PATH 前缀，start_service.sh 和 run_server.sh 共用 |
 
@@ -161,3 +162,4 @@ curl http://localhost:10241/v1/models
 - **422 vs 500 错误区分**：wrapper 层捕获 `generate()` 阶段的异常，坏音频文件（格式不支持、解码失败）返回 HTTP 422 + `"Audio decode failed: ..."` detail，客户端可安全跳过；服务端配置错误（ffmpeg 缺失等）和未知异常保持 500，客户端应重试。分类器使用精确消息匹配 + 保守默认 500，避免 false positive。
 - **Direct-to-model 架构**：`server_diarize.py` 不再委托原始 handler（`stt_transcriptions`），而是直接调用 `model_provider.load_model()` + `stt_model.generate(tempfile_path)`。消除了原始 handler 的 decode→reencode→decode 路径（double-decode），大文件内存占用从 ~13GB 降至 ~6.6GB 峰值。
 - **Upload 流式 spool**：`_spool_to_tempfile` 用 async 64KB 分块读写 + 实时字节计数，超过 `MAX_UPLOAD_BYTES` 立即中断 + 清理 + HTTP 413。不将整个文件拉进内存。
+- **GPU 推理串行化**：`_gpu_lock`（`asyncio.Lock`，懒加载）保证同时只有一个 `generate()` 或 `diarize()` 在 GPU 上运行。`load_model()` 不进锁（仅 lazy load，无 GPU 操作）。锁等待用 `asyncio.wait_for` 在 event loop 内完成，不消耗线程池 slot。Stream 路径 generator 在 Starlette threadpool 中运行，finally 通过 `loop.call_soon_threadsafe` 将 release 调度回 event loop 线程。懒加载确保 Lock 在 uvicorn 启动后的 event loop 内创建（Python 3.10+ 要求）。超时（`GPU_LOCK_TIMEOUT` 秒）→ HTTP 503，不崩溃。

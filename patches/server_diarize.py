@@ -34,6 +34,26 @@ logger = logging.getLogger("stt_proxy.diarize")
 _MAX_UPLOAD_BYTES = int(os.getenv("MAX_UPLOAD_BYTES", str(500 * 1024 * 1024)))  # 500MB
 _SPOOL_CHUNK_SIZE = 64 * 1024  # 64KB read chunks
 
+# ── GPU 串行化锁 ──────────────────────────────────────────────────────────────
+# Metal GPU 不支持并发 command buffer 编码，asyncio.Lock 串行所有 generate/diarize
+# 调用。锁等待在 event loop 内完成（asyncio.wait_for），不消耗线程池 slot。
+#
+# 懒加载原因：asyncio.Lock() 必须在运行中的 event loop 内创建（Python 3.10+），
+# 模块级直接实例化会在 import 阶段（uvicorn 未启动时）崩溃。
+_GPU_LOCK_TIMEOUT_SEC: int = int(os.getenv("GPU_LOCK_TIMEOUT", "300"))
+_gpu_lock: Optional[asyncio.Lock] = None
+
+
+def _get_gpu_lock() -> asyncio.Lock:
+    """获取 GPU 串行化锁，首次调用时在当前 event loop 内懒加载创建。
+
+    必须从 async 上下文调用（event loop 运行中），确保 Lock 绑定到正确的 loop。
+    """
+    global _gpu_lock
+    if _gpu_lock is None:
+        _gpu_lock = asyncio.Lock()
+    return _gpu_lock
+
 # ── Audio decode error patterns (from mlx-audio audio_io.py) ──
 # Service config errors: ffmpeg/ffprobe not installed (always 500)
 _SERVICE_ERROR_MARKERS = ("ffmpeg not found", "ffprobe not found")
@@ -173,6 +193,37 @@ def _safe_remove(path: str):
         pass
 
 
+async def _acquire_gpu_or_503() -> None:
+    """在 event loop 内获取 GPU 锁，超时则抛 HTTPException(503)。
+
+    使用 asyncio.wait_for 等待，不占用线程池 slot。
+    用于 non-stream 和 diarize ASR 阶段（超时直接失败，无部分结果）。
+    调用方须在 finally 中调用 _get_gpu_lock().release()。
+    """
+    try:
+        await asyncio.wait_for(_get_gpu_lock().acquire(), timeout=_GPU_LOCK_TIMEOUT_SEC)
+    except asyncio.TimeoutError:
+        raise HTTPException(
+            status_code=503,
+            detail=f"GPU busy — request queued for over {_GPU_LOCK_TIMEOUT_SEC}s, retry later",
+        )
+
+
+async def _acquire_gpu_or_timeout() -> None:
+    """在 event loop 内获取 GPU 锁，超时则抛 TimeoutError。
+
+    使用 asyncio.wait_for 等待，不占用线程池 slot。
+    用于 diarize speaker 阶段（ASR 已完成，超时 → 降级为纯 ASR + diarization_error）。
+    调用方须在 finally 中调用 _get_gpu_lock().release()。
+    """
+    try:
+        await asyncio.wait_for(_get_gpu_lock().acquire(), timeout=_GPU_LOCK_TIMEOUT_SEC)
+    except asyncio.TimeoutError:
+        raise TimeoutError(
+            f"GPU busy — diarization queued for over {_GPU_LOCK_TIMEOUT_SEC}s"
+        )
+
+
 def _generate_stream(stt_model, tmp_path: str, gen_kwargs: dict):
     """Sync generator: call generate(stream=True) and yield NDJSON lines.
 
@@ -302,18 +353,33 @@ def setup(app: FastAPI):
             if not want_diarize:
                 # ── Non-diarize path ──
                 if stream:
-                    # stream=true: sync generator via StreamingResponse
+                    # stream=true: acquire lock before starting generator.
+                    # Generator runs in Starlette threadpool; finally releases
+                    # lock via call_soon_threadsafe back to event loop thread.
+                    await _acquire_gpu_or_503()
+                    loop = asyncio.get_running_loop()
+
+                    def _locked_gen():
+                        try:
+                            yield from _generate_stream(stt_model, tmp_path, gen_kwargs)
+                        finally:
+                            loop.call_soon_threadsafe(_get_gpu_lock().release)
+
                     response = StreamingResponse(
-                        _generate_stream(stt_model, tmp_path, gen_kwargs),
-                        media_type="application/x-ndjson",
+                        _locked_gen(), media_type="application/x-ndjson"
                     )
                     response.background = BackgroundTask(_safe_remove, tmp_path)
                     return response
                 else:
-                    # stream=false: generate() returns STTOutput dataclass
-                    result = await asyncio.to_thread(
-                        stt_model.generate, tmp_path, **gen_kwargs
-                    )
+                    # stream=false: GPU work in thread, lock held for duration
+                    await _acquire_gpu_or_503()
+                    try:
+                        result = await asyncio.to_thread(
+                            stt_model.generate, tmp_path, **gen_kwargs
+                        )
+                    finally:
+                        _get_gpu_lock().release()
+
                     content = json.dumps(sanitize_for_json(result)) + "\n"
                     response = Response(
                         content=content, media_type="application/x-ndjson"
@@ -323,23 +389,33 @@ def setup(app: FastAPI):
 
             else:
                 # ── Diarize path (stream already rejected above) ──
-                # ASR: single decode via generate()
-                # Force stream=False for ASR phase
+                # ASR phase: single decode via generate()
                 asr_kwargs = {k: v for k, v in gen_kwargs.items() if k != "stream"}
-                result = await asyncio.to_thread(
-                    stt_model.generate, tmp_path, **asr_kwargs
-                )
+                await _acquire_gpu_or_503()
+                try:
+                    result = await asyncio.to_thread(
+                        stt_model.generate, tmp_path, **asr_kwargs
+                    )
+                finally:
+                    _get_gpu_lock().release()
+
                 asr_result = sanitize_for_json(result)
 
-                # Diarization: pass tempfile path directly (no extra decode)
+                # Diarize phase: timeout → graceful ASR-only fallback (not 503)
                 try:
-                    speaker_timeline = await asyncio.to_thread(
-                        _diarizer.diarize,
-                        tmp_path,
-                        num_speakers=num_speakers,
-                        min_speakers=min_speakers,
-                        max_speakers=max_speakers,
-                    )
+                    await _acquire_gpu_or_timeout()
+                    try:
+                        speaker_timeline = await asyncio.to_thread(
+                            lambda: _diarizer.diarize(
+                                tmp_path,
+                                num_speakers=num_speakers,
+                                min_speakers=min_speakers,
+                                max_speakers=max_speakers,
+                            )
+                        )
+                    finally:
+                        _get_gpu_lock().release()
+
                     enriched = assign_speakers(asr_result, speaker_timeline)
                     return JSONResponse(enriched)
 

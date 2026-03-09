@@ -1021,3 +1021,268 @@ class TestDiarizerFilePathInput:
             torch.testing.assert_close(wf_path, wf_bytes)
         finally:
             os.unlink(path)
+
+
+# ---------------------------------------------------------------------------
+# Test: patches/audio_io_fix.py — Patch 2: AMR/AWB read() routing
+# ---------------------------------------------------------------------------
+
+
+class TestAmrAwbReadRouting:
+    """Test that .amr/.awb extensions are routed to ffmpeg via _read_patched."""
+
+    def _apply_patch(self):
+        """Import audio_io_fix to ensure both patches are applied."""
+        import patches.audio_io_fix  # noqa: F401 — side-effect import
+
+    def test_amr_ext_calls_decode_ffmpeg(self):
+        """.amr path → _decode_ffmpeg called, not miniaudio."""
+        self._apply_patch()
+        import mlx_audio.audio_io as _audio_io
+
+        fake_samples = np.zeros(16000, dtype=np.int16)
+        with patch.object(_audio_io, "_decode_ffmpeg",
+                          return_value=(fake_samples, 16000, 1)) as mock_ffmpeg:
+            result = _audio_io.read("/tmp/test.amr")
+
+        mock_ffmpeg.assert_called_once_with("/tmp/test.amr")
+        audio, sr = result
+        assert sr == 16000
+
+    def test_awb_ext_calls_decode_ffmpeg(self):
+        """.awb path → _decode_ffmpeg called, not miniaudio."""
+        self._apply_patch()
+        import mlx_audio.audio_io as _audio_io
+
+        fake_samples = np.zeros(8000, dtype=np.int16)
+        with patch.object(_audio_io, "_decode_ffmpeg",
+                          return_value=(fake_samples, 8000, 1)) as mock_ffmpeg:
+            result = _audio_io.read("/tmp/recording.AWB")  # uppercase extension
+
+        mock_ffmpeg.assert_called_once_with("/tmp/recording.AWB")
+        audio, sr = result
+        assert sr == 8000
+
+    def test_wav_ext_not_intercepted(self):
+        """.wav path is NOT intercepted — falls through to original read()."""
+        self._apply_patch()
+        import mlx_audio.audio_io as _audio_io
+
+        sentinel = object()
+        with patch("patches.audio_io_fix._original_read",
+                   return_value=sentinel) as mock_orig:
+            result = _audio_io.read("/tmp/test.wav")
+
+        mock_orig.assert_called_once_with("/tmp/test.wav", always_2d=False, dtype="float64")
+        assert result is sentinel
+
+    def test_dtype_float32_conversion(self):
+        """.amr → dtype=float32 converts int16 samples to [-1, 1] range."""
+        self._apply_patch()
+        import mlx_audio.audio_io as _audio_io
+
+        # int16 max value → float32 should be ≈ 1.0
+        fake_samples = np.array([32767], dtype=np.int16)
+        with patch.object(_audio_io, "_decode_ffmpeg",
+                          return_value=(fake_samples, 16000, 1)):
+            audio, sr = _audio_io.read("/tmp/test.amr", dtype="float32")
+
+        assert audio.dtype == np.float32
+        assert abs(audio[0] - (32767 / 32768.0)) < 1e-5
+
+    def test_stereo_reshape(self):
+        """.amr stereo (nchannels=2) → output shape (samples, 2)."""
+        self._apply_patch()
+        import mlx_audio.audio_io as _audio_io
+
+        # 4 interleaved stereo samples → shape (2, 2) after reshape
+        fake_samples = np.array([1, 2, 3, 4], dtype=np.int16)
+        with patch.object(_audio_io, "_decode_ffmpeg",
+                          return_value=(fake_samples, 16000, 2)):
+            audio, sr = _audio_io.read("/tmp/test.amr", dtype="int16")
+
+        assert audio.shape == (2, 2)
+
+    def test_always_2d_mono(self):
+        """.amr mono + always_2d=True → shape (samples, 1)."""
+        self._apply_patch()
+        import mlx_audio.audio_io as _audio_io
+
+        fake_samples = np.zeros(100, dtype=np.int16)
+        with patch.object(_audio_io, "_decode_ffmpeg",
+                          return_value=(fake_samples, 16000, 1)):
+            audio, _ = _audio_io.read("/tmp/test.amr", always_2d=True, dtype="int16")
+
+        assert audio.shape == (100, 1)
+
+
+# ---------------------------------------------------------------------------
+# Test: patches/server_diarize.py — GPU lock serialization
+# ---------------------------------------------------------------------------
+
+class TestGpuLock:
+    """Test GPU lock serialization: 503 on timeout, graceful fallback, lock release."""
+
+    def setup_method(self):
+        """Reset lazy lock so each test binds a fresh asyncio.Lock to its own event loop."""
+        import patches.server_diarize as sd
+        sd._gpu_lock = None
+
+    # ── Test 1: non-stream 路径 503 ──
+
+    def test_503_on_non_stream_timeout(self, monkeypatch):
+        """Lock held → _acquire_gpu_or_503() raises HTTPException(503)."""
+        from fastapi import HTTPException
+        import patches.server_diarize as sd
+        monkeypatch.setattr(sd, "_GPU_LOCK_TIMEOUT_SEC", 0)
+
+        async def _test():
+            lock = sd._get_gpu_lock()
+            await lock.acquire()
+            try:
+                with pytest.raises(HTTPException) as exc_info:
+                    await sd._acquire_gpu_or_503()
+                assert exc_info.value.status_code == 503
+            finally:
+                lock.release()
+
+        asyncio.run(_test())
+
+    # ── Test 2: stream 路径 503 ──
+
+    def test_503_on_stream_timeout_raises_http_exception(self, monkeypatch):
+        """Lock held → _acquire_gpu_or_503() raises HTTPException(503) (stream path logic)."""
+        from fastapi import HTTPException
+        import patches.server_diarize as sd
+        monkeypatch.setattr(sd, "_GPU_LOCK_TIMEOUT_SEC", 0)
+
+        async def _test():
+            lock = sd._get_gpu_lock()
+            await lock.acquire()
+            try:
+                with pytest.raises(HTTPException) as exc_info:
+                    await sd._acquire_gpu_or_503()
+                assert exc_info.value.status_code == 503
+            finally:
+                lock.release()
+
+        asyncio.run(_test())
+
+    # ── Test 3: diarize 超时降级 ──
+
+    def test_graceful_fallback_on_diarize_timeout(self, monkeypatch):
+        """Lock held → _acquire_gpu_or_timeout() raises TimeoutError (not HTTPException)."""
+        import patches.server_diarize as sd
+        monkeypatch.setattr(sd, "_GPU_LOCK_TIMEOUT_SEC", 0)
+
+        async def _test():
+            lock = sd._get_gpu_lock()
+            await lock.acquire()
+            try:
+                with pytest.raises(TimeoutError):
+                    await sd._acquire_gpu_or_timeout()
+            finally:
+                lock.release()
+
+        asyncio.run(_test())
+
+    # ── Test 4: 成功后锁释放 ──
+
+    def test_lock_released_on_success(self):
+        """Lock is released in finally after successful generate."""
+        async def _test():
+            import patches.server_diarize as sd
+            await sd._acquire_gpu_or_503()
+            try:
+                pass  # simulate generate()
+            finally:
+                sd._get_gpu_lock().release()
+
+            # 验证锁已释放：能成功重新获取
+            await asyncio.wait_for(sd._get_gpu_lock().acquire(), timeout=0.1)
+            sd._get_gpu_lock().release()
+
+        asyncio.run(_test())
+
+    # ── Test 5: 异常后锁释放 ──
+
+    def test_lock_released_on_exception(self):
+        """Lock is released in finally even when generate() raises."""
+        async def _test():
+            import patches.server_diarize as sd
+            await sd._acquire_gpu_or_503()
+            try:
+                try:
+                    raise RuntimeError("GPU exploded")
+                finally:
+                    sd._get_gpu_lock().release()
+            except RuntimeError:
+                pass
+
+            await asyncio.wait_for(sd._get_gpu_lock().acquire(), timeout=0.1)
+            sd._get_gpu_lock().release()
+
+        asyncio.run(_test())
+
+    # ── Test 6: stream generator 流结束后通过 call_soon_threadsafe 释放锁 ──
+
+    def test_stream_generator_releases_lock_via_call_soon_threadsafe(self):
+        """Lock released via loop.call_soon_threadsafe after stream generator exhausted."""
+        async def _test():
+            import patches.server_diarize as sd
+            lock = sd._get_gpu_lock()
+            await lock.acquire()
+            loop = asyncio.get_running_loop()
+            chunks = []
+
+            def _locked_gen():
+                try:
+                    for item in ["a", "b", "c"]:
+                        yield item
+                finally:
+                    loop.call_soon_threadsafe(lock.release)
+
+            # 在线程中消费 generator，模拟 Starlette iterate_in_threadpool 行为
+            def _consume():
+                for chunk in _locked_gen():
+                    chunks.append(chunk)
+
+            await asyncio.to_thread(_consume)
+            await asyncio.sleep(0)  # 让 call_soon_threadsafe 回调执行
+
+            assert chunks == ["a", "b", "c"]
+            # 锁已释放，应能重新获取
+            await asyncio.wait_for(lock.acquire(), timeout=0.1)
+            lock.release()
+
+        asyncio.run(_test())
+
+    # ── Test 7: stream generator 客户端断开后锁释放 ──
+
+    def test_stream_generator_releases_lock_on_close(self):
+        """Lock released when generator.close() is called (simulates client disconnect)."""
+        async def _test():
+            import patches.server_diarize as sd
+            lock = sd._get_gpu_lock()
+            await lock.acquire()
+            loop = asyncio.get_running_loop()
+
+            def _locked_gen():
+                try:
+                    yield "a"
+                    yield "b"
+                finally:
+                    loop.call_soon_threadsafe(lock.release)
+
+            def _consume_partial():
+                gen = _locked_gen()
+                next(gen)    # consume first item
+                gen.close()  # simulate disconnect (triggers finally → call_soon_threadsafe)
+
+            await asyncio.to_thread(_consume_partial)
+            await asyncio.sleep(0)  # 让 call_soon_threadsafe 回调执行
+
+            await asyncio.wait_for(lock.acquire(), timeout=0.1)
+            lock.release()
+
+        asyncio.run(_test())
