@@ -20,6 +20,7 @@ import json
 import logging
 import os
 import tempfile
+import threading
 
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.responses import JSONResponse, Response, StreamingResponse
@@ -197,8 +198,8 @@ async def _acquire_gpu_or_503() -> None:
     """在 event loop 内获取 GPU 锁，超时则抛 HTTPException(503)。
 
     使用 asyncio.wait_for 等待，不占用线程池 slot。
-    用于 non-stream 和 diarize ASR 阶段（超时直接失败，无部分结果）。
-    调用方须在 finally 中调用 _get_gpu_lock().release()。
+    用于 stream / non-stream / diarize ASR 阶段（超时直接失败，无部分结果）。
+    调用方负责释放：non-stream 与 diarize 在 finally 中 release；stream 由 worker 线程结束时的回调释放。
     """
     try:
         await asyncio.wait_for(_get_gpu_lock().acquire(), timeout=_GPU_LOCK_TIMEOUT_SEC)
@@ -228,7 +229,7 @@ def _generate_stream(stt_model, tmp_path: str, gen_kwargs: dict):
     """Sync generator: call generate(stream=True) and yield NDJSON lines.
 
     Pure business logic — does NOT manage tempfile cleanup.
-    Caller attaches BackgroundTask(_safe_remove) to the response.
+    Caller (_stream_ndjson worker) owns tempfile cleanup and the GPU lock.
 
     Args:
         stt_model: Loaded STT model.
@@ -258,6 +259,51 @@ def _generate_stream(stt_model, tmp_path: str, gen_kwargs: dict):
     else:
         # Shouldn't happen with stream=True, but handle gracefully
         yield json.dumps(sanitize_for_json(result)) + "\n"
+
+
+async def _stream_ndjson(stt_model, tmp_path: str, gen_kwargs: dict):
+    """Take the GPU lock and stream generate() as NDJSON lines (async iterator).
+
+    A worker thread runs generate(stream=True) and owns the lock: it is released
+    when the *thread* ends, not when the response is finalized. Starlette cancels
+    (never closes) the body iterator on client disconnect, so tying release to
+    generator finalization leaks the lock. The worker also removes tmp_path and
+    stops early once the consumer is gone.
+    """
+    await _acquire_gpu_or_503()
+    loop = asyncio.get_running_loop()
+    lines: asyncio.Queue = asyncio.Queue()
+    stop = threading.Event()
+
+    def put(item):
+        loop.call_soon_threadsafe(lines.put_nowait, item)
+
+    def work():
+        try:
+            for line in _generate_stream(stt_model, tmp_path, gen_kwargs):
+                if stop.is_set():
+                    return
+                put(line)
+        except Exception as exc:
+            put(exc)
+        finally:
+            _safe_remove(tmp_path)
+            put(None)
+
+    loop.run_in_executor(None, work).add_done_callback(
+        lambda _: _get_gpu_lock().release()
+    )
+
+    async def body():
+        try:
+            while (item := await lines.get()) is not None:
+                if isinstance(item, Exception):
+                    raise item
+                yield item
+        finally:
+            stop.set()
+
+    return body()
 
 
 # ── Route setup ──────────────────────────────────────────────────────────
@@ -353,23 +399,10 @@ def setup(app: FastAPI):
             if not want_diarize:
                 # ── Non-diarize path ──
                 if stream:
-                    # stream=true: acquire lock before starting generator.
-                    # Generator runs in Starlette threadpool; finally releases
-                    # lock via call_soon_threadsafe back to event loop thread.
-                    await _acquire_gpu_or_503()
-                    loop = asyncio.get_running_loop()
-
-                    def _locked_gen():
-                        try:
-                            yield from _generate_stream(stt_model, tmp_path, gen_kwargs)
-                        finally:
-                            loop.call_soon_threadsafe(_get_gpu_lock().release)
-
-                    response = StreamingResponse(
-                        _locked_gen(), media_type="application/x-ndjson"
-                    )
-                    response.background = BackgroundTask(_safe_remove, tmp_path)
-                    return response
+                    # stream=true: worker thread owns the GPU lock and tmp_path
+                    # (see _stream_ndjson); 503 is still raised here, before headers.
+                    lines = await _stream_ndjson(stt_model, tmp_path, gen_kwargs)
+                    return StreamingResponse(lines, media_type="application/x-ndjson")
                 else:
                     # stream=false: GPU work in thread, lock held for duration
                     await _acquire_gpu_or_503()
