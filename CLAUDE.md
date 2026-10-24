@@ -68,8 +68,14 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ├── deployment/
 │   └── com.sttproxy.plist  # macOS LaunchAgent 配置
 ├── tests/
-│   ├── test_service.py     # 黑盒端到端测试（需服务运行）
-│   └── test_patches.py     # patches 单元测试（无需服务运行）
+│   ├── test_service.py              # 黑盒端到端测试（需服务运行）
+│   ├── test_apply_all.py            # patches/__init__.py（apply_all 幂等）
+│   ├── test_audio_io_fix.py         # patches/audio_io_fix.py（AMR/AWB 路由）
+│   ├── test_generate_enhance.py     # patches/generate_enhance.py
+│   ├── test_gpu_lock.py             # GPU 锁串行化 + stream 断连释放锁
+│   ├── test_server_diarize.py       # patches/server_diarize.py（分类器/spool/gen_kwargs 等）
+│   ├── test_speaker_diarization.py  # patches/speaker_diarization.py
+│   └── test_vad_chunking.py         # patches/vad_chunking.py
 ├── docs/
 │   └── operations.md       # 运维手册
 └── logs/                   # 运行时日志（.gitignore 排除）
@@ -93,8 +99,11 @@ python run_server.py --host 0.0.0.0 --port 10241 --workers 1
 ### Testing
 
 ```bash
+# 单元测试（无需服务运行；必须 python -m pytest 从仓库根运行，裸 pytest 找不到 patches 包）
+python -m pytest tests -m "not integration" -v
+
 # 端到端测试（需要服务运行中）
-pytest tests/ -v
+python -m pytest tests -m integration -v
 
 # 手动测试转写
 python scripts/send_test_request.py audio.wav
@@ -137,10 +146,10 @@ curl http://localhost:10241/v1/models
 
 两层测试：
 
-### 单元测试（`tests/test_patches.py`）
-- 无需运行中的服务
+### 单元测试（`tests/test_*.py`，除 `test_service.py`）
+- 无需运行中的服务；按被测 patch 模块拆分，一个文件对应一个模块（GPU 锁的两组测试并入 `test_gpu_lock.py`）
 - 测试 patch 逻辑隔离正确性：VAD 切分边界、尾帧安全、默认参数注入、language 回填、speaker 对齐、滑动窗口、AHC 聚类、tempfile spool（含 413 熔断）、gen_kwargs 动态过滤、文件路径输入
-- `pytest tests/test_patches.py -v`
+- `python -m pytest tests -m "not integration" -v`
 
 ### 端到端测试（`tests/test_service.py`）
 - 纯黑盒：不 mock 第三方库内部，直接向运行中的服务发 HTTP 请求
